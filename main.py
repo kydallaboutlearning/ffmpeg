@@ -33,9 +33,10 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
     try:
         data = await request.json()
         image_url = data.get("image_url")
-        length = str(data.get("length", 5))
+        duration = float(data.get("length", 5))
         frame_rate = int(data.get("frame_rate", 25))
         zoom_speed = float(data.get("zoom_speed", 0.003))
+        frame_count = int(duration * frame_rate)
 
         if not image_url:
             raise HTTPException(status_code=400, detail="Missing image_url")
@@ -48,16 +49,17 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         if download.returncode != 0 or not os.path.exists(input_image) or os.path.getsize(input_image) < 1000:
             raise HTTPException(status_code=422, detail="Image download failed or file invalid")
 
+        # TikTok-style vertical formatting with animated zoom
         zoom_expr = (
-            f"zoompan=z='if(lte(zoom,1.0),1.2,zoom+{zoom_speed})'"
-            f":d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
-            f"fps={frame_rate},scale=720:1280"
+            f"zoompan=z='if(lte(zoom,1.0),1.2,zoom+{zoom_speed})':d=1:s={frame_count}:"
+            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',fps={frame_rate},"
+            f"scale=w=720:h=-1,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"
         )
 
         cmd = [
-            "ffmpeg", "-y", "-loop", "1", "-i", input_image,
+            "ffmpeg", "-y", "-i", input_image,
             "-vf", zoom_expr,
-            "-t", length, "-pix_fmt", "yuv420p", output_video
+            "-pix_fmt", "yuv420p", output_video
         ]
 
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
