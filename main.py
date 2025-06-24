@@ -70,7 +70,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
 
         background_tasks.add_task(delete_files, [input_image, output_video], delay=3600)
 
-        return {"clip_path": output_video, "public_url": f"/static/clips/{os.path.basename(output_video)}"}
+        return {"clip_path": output_video, "public_url": f"https://image-to-video-api-qkjd.onrender.com/static/clips/{os.path.basename(output_video)}"}
 
     except HTTPException as http_err:
         raise http_err
