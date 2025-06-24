@@ -1,0 +1,8 @@
+__pycache__/
+*.mp4
+*.jpg
+*.png
+*.zip
+.env
+node_modules/
+local_tests/
