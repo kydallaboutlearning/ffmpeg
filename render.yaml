@@ -1,34 +1,54 @@
 # render.yaml
-# For more information on Render Blueprints: https://render.com/docs/blueprint
-services:
-  - type: web
-    name: tiktok-video-api
-    env: python
-    region: oregon # Choose a region closest to your users or other services (e.g., oregon, frankfurt, singapore)
-    plan: free # Or 'standard' for more resources. 'starter' might be sufficient for light usage.
-    branch: main # Or the branch you want to deploy from
-    buildCommand: |
-      # Install ffmpeg via apt-get (Render's underlying OS is Debian-based)
-      apt-get update -y
-      apt-get install -y ffmpeg
-      # Install Python dependencies
-      pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /
-    envVars:
-      - key: PORT
-        value: 10000 # Render automatically sets this, but it's good practice to define for uvicorn
-      - key: PYTHON_VERSION
-        value: 3.10.12 # Or your specific Python version from requirements.txt or local environment
-      # Add any other environment variables your app might need
-      # - key: MY_API_KEY
-      #   value: my_secret_key
 
-# Optional: If you want a persistent disk for generated videos (highly recommended for production)
-# You would then modify your FastAPI code to save files to this disk, e.g., /var/data/
-# And configure your cleanup to only remove from this disk, or use cloud storage like S3.
-# This setup requires a Starter+ plan.
-# disks:
-#   - name: video-storage
-#     mountPath: /var/data
-#     sizeGB: 10 # Adjust size as needed
+# This specifies the version of the Render Blueprint spec.
+version: 1
+
+# Define the services that make up your application.
+services:
+  # This defines a web service, which is accessible via HTTP.
+  - type: web
+    name: tiktok-video-api # A unique name for your service on Render
+    env: python # The runtime environment for your service (Python)
+    region: oregon # Recommended region (often closest to US/Europe, or choose one near your users if different)
+    
+    # --- IMPORTANT: Using the 'free' plan as requested ---
+    # Be aware that the free tier has severe limitations for CPU-intensive tasks
+    # like FFmpeg video processing. Expect timeouts, slow responses, and potential
+    # service crashes due to limited CPU/RAM and service sleeping after inactivity.
+    plan: free 
+
+    branch: main # The Git branch that Render should deploy from (e.g., 'main' or 'master')
+
+    # The build command is executed when Render deploys your service.
+    # This is where we install system-level dependencies like FFmpeg
+    # and then your Python dependencies.
+    buildCommand: |
+      echo "--- Updating apt-get and installing FFmpeg ---"
+      # Update package lists to ensure we get the latest FFmpeg version
+      apt-get update -y
+      # Install FFmpeg. The -y flag automatically answers yes to prompts.
+      apt-get install -y ffmpeg
+      echo "--- Installing Python dependencies ---"
+      # Install your Python packages from requirements.txt
+      pip install -r requirements.txt
+
+    # The start command is executed after the build is complete, to run your application.
+    # Uvicorn is used to serve your FastAPI app.
+    # $PORT is an environment variable automatically provided by Render.
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+    # A health check path. Render will periodically hit this endpoint
+    # to ensure your service is running. If it returns a non-200 status,
+    # Render might restart your service.
+    healthCheckPath: /
+
+    # Environment variables for your service.
+    envVars:
+      # Render provides the PORT environment variable; Uvicorn needs to use it.
+      - key: PORT
+        value: 10000 # Example port, Render will set the actual external port
+
+      # Explicitly set Python version for consistency.
+      # Make sure this matches your local Python version or what's in requirements.txt.
+      - key: PYTHON_VERSION
+        value: 3.10.12 # Adjust to your specific version if different (e.g., 3.9.18, 3.11.x)

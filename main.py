@@ -1,11 +1,35 @@
 import os
 import uuid
-import httpx
 import asyncio
+import httpx
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from datetime import datetime
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, model_validator # Import model_validator for Pydantic v2
+import logging # New import for logging
+
+# --- Setup Logging ---
+# Create a logger instance
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG) # Set to DEBUG to capture all messages
+
+# Create console handler and set level to debug
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)
+
+# Create formatter
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Add formatter to ch
+ch.setFormatter(formatter)
+
+# Add ch to logger
+if not logger.handlers: # Prevent adding multiple handlers if reloaded
+    logger.addHandler(ch)
+# --- End Setup Logging ---
+
 
 app = FastAPI(
     title="TikTok Video Generator API",
@@ -13,315 +37,352 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# --- Configuration (can be moved to a separate config.py or .env) ---
-TEMP_FILES_DIR = "temp_files"
-TIKTOK_REELS_WIDTH = 720
-TIKTOK_REELS_HEIGHT = 1280
+# Setup folders
+CLIP_DIR = "static/clips"
+FINAL_DIR = "static/final"
+os.makedirs(CLIP_DIR, exist_ok=True)
+os.makedirs(FINAL_DIR, exist_ok=True)
 
-# Ensure the temporary directory exists
-os.makedirs(TEMP_FILES_DIR, exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# --- Pydantic Models for Request Bodies ---
-
+# --- Pydantic Models for Request Body ---
 class GenerateClipRequest(BaseModel):
     """
     Request body for generating a single video clip from an image.
     """
     image_url: str = Field(..., description="URL of the image (576x1024 recommended) to use for the clip.")
-    length: float = Field(..., gt=0, description="Duration of the video clip in seconds.")
+    length: float = Field(5.0, gt=0, description="Duration of the video clip in seconds.")
     frame_rate: int = Field(25, gt=0, description="Frames per second of the output video.")
-    zoom_speed: float = Field(0.003, ge=0, description="Speed of the zoom effect. Higher value means faster zoom.")
-    id: Optional[str] = Field(None, description="Optional unique ID for the request. If not provided, a UUID will be generated.")
-
-class ClipInfo(BaseModel):
-    """
-    Information about an existing video clip to be used in processing.
-    """
-    filename: str = Field(..., description="Path/filename of the existing video clip.")
-    # Optional: You could add start_time and end_time here if you want to trim individual clips
-    # before concatenation, but the current `concat` demuxer approach won't directly support it.
-    # For trimming, you'd need to pre-process each clip individually.
-
-class SubtitleEntry(BaseModel):
-    """
-    Details for a single subtitle entry.
-    """
-    text: str = Field(..., min_length=1, description="The text content of the subtitle.")
-    start_time: float = Field(..., ge=0, description="Start time of the subtitle in seconds (relative to the final video).")
-    end_time: float = Field(..., gt=0, description="End time of the subtitle in seconds (relative to the final video).")
-
-    class Config:
-        validate_assignment = True
-
-    @classmethod
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        # Ensure end_time is always greater than start_time
-        def validate_times(self):
-            if self.end_time <= self.start_time:
-                raise ValueError("end_time must be greater than start_time")
-        cls.model_post_init = validate_times
+    max_zoom: float = Field(1.25, ge=1.0, description="Maximum zoom factor. Image starts at 1/max_zoom and grows to 1.0.")
 
 
-class ProcessClipsRequest(BaseModel):
-    """
-    Request body for joining multiple clips, adding subtitles and voice-over.
-    """
-    clips: List[ClipInfo] = Field(..., min_items=1, description="List of video clips to be concatenated.")
-    voice_over_audio_url: Optional[str] = Field(None, description="URL of the audio file to use as a voice-over.")
-    subtitles: List[SubtitleEntry] = Field([], description="List of subtitle entries to overlay on the video.")
-    output_filename: Optional[str] = Field(None, description="Desired name for the output video file. If not provided, a UUID will be generated.")
-
-# --- Helper Function to Run FFmpeg ---
-
+# --- Helper Function to Run FFmpeg (Async) ---
 async def run_ffmpeg_command(command: list[str]):
     """
     Executes an FFmpeg command asynchronously.
     Raises HTTPException if FFmpeg returns a non-zero exit code.
     """
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
+    logger.info(f"Attempting to execute FFmpeg command: {' '.join(command)}")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", # This is the command that needs to be in PATH
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
 
-    if process.returncode != 0:
-        error_message = f"FFmpeg error:\nSTDOUT:\n{stdout.decode()}\nSTDERR:\n{stderr.decode()}"
-        print(error_message) # Log the full FFmpeg error for debugging
-        raise HTTPException(status_code=500, detail=f"FFmpeg command failed. See logs for details.")
-    
-    print(f"FFmpeg command executed successfully. STDOUT: {stdout.decode()}\nSTDERR: {stderr.decode()}")
+        if process.returncode != 0:
+            error_message = (
+                f"FFmpeg command failed with exit code {process.returncode}.\n"
+                f"STDOUT:\n{stdout.decode(errors='ignore')}\n"
+                f"STDERR:\n{stderr.decode(errors='ignore')}"
+            )
+            logger.error(error_message) # Log the full FFmpeg error for debugging
+            raise HTTPException(status_code=500, detail=f"FFmpeg command failed. See server logs for details.")
+        
+        logger.info(f"FFmpeg command executed successfully.")
+        logger.debug(f"FFmpeg STDOUT: {stdout.decode(errors='ignore')}")
+        logger.debug(f"FFmpeg STDERR: {stderr.decode(errors='ignore')}")
+
+    except FileNotFoundError: # This specifically catches [Errno 2] if 'ffmpeg' isn't found
+        logger.critical("FFmpeg executable not found. Please ensure FFmpeg is installed and in your system's PATH.")
+        raise HTTPException(status_code=500, detail="FFmpeg not found. Is it installed and in your PATH?")
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred while trying to run FFmpeg: {e}")
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
 
 
-# --- Background Task for File Cleanup ---
-
-def cleanup_file(filepath: str):
-    """Removes a file from the filesystem."""
-    if os.path.exists(filepath):
+def delete_files(paths: List[str], delay=3600):
+    """
+    Deletes files from the given paths after a specified delay.
+    This is intended to clean up temporary files generated by the application.
+    """
+    time.sleep(delay)
+    for path in paths:
         try:
-            os.remove(filepath)
-            print(f"Cleaned up temporary file: {filepath}")
+            if os.path.exists(path):
+                os.remove(path)
+                logger.info(f"Cleaned up temporary file: {path}")
+            else:
+                logger.warning(f"Attempted to delete non-existent file: {path}")
         except Exception as e:
-            print(f"Error cleaning up file {filepath}: {e}")
+            logger.error(f"Error deleting {path}: {e}")
 
-# --- Endpoint 1: Generate TikTok Clip from Image ---
-
-@app.post("/generate-clip/", summary="Generate a TikTok-style video clip from an image")
-async def generate_clip_endpoint(request: GenerateClipRequest, background_tasks: BackgroundTasks):
+@app.post("/generate-clip", summary="Generate a TikTok-style video clip from an image")
+async def generate_clip_endpoint(request_data: GenerateClipRequest, background_tasks: BackgroundTasks):
     """
     Generates a vertical video clip (suitable for TikTok/Reels) from a single image.
-    The image will be zoomed and panned over the specified duration.
+    The image will grow smoothly to fill the 9:16 frame.
 
     - **image_url**: URL of the input image (ideally 576x1024 or similar 9:16 aspect ratio).
     - **length**: Desired duration of the output video in seconds.
     - **frame_rate**: Frames per second for the output video.
-    - **zoom_speed**: Controls how fast the image zooms in. A value of 0.003 is a good starting point.
-    - **id**: An optional unique identifier for the request, used in the output filename.
+    - **max_zoom**: Defines how much the image will "grow". A value of 1.25 means it starts at 80% and grows to 100%.
     """
-    request_id = request.id if request.id else str(uuid.uuid4())
-    image_temp_path = os.path.join(TEMP_FILES_DIR, f"input_image_{request_id}.png")
-    output_video_path = os.path.join(TEMP_FILES_DIR, f"tiktok_clip_{request_id}.mp4")
+    logger.info(f"Received request to generate clip for image: {request_data.image_url}")
+    
+    image_url = request_data.image_url
+    duration = request_data.length
+    frame_rate = request_data.frame_rate
+    max_grow_factor = request_data.max_zoom
+    
+    # --- Output video resolution for standard Reels (9:16 aspect ratio) ---
+    output_width = 720
+    output_height = 1280
 
-    # Add files to cleanup in background
-    background_tasks.add_task(cleanup_file, image_temp_path)
-    background_tasks.add_task(cleanup_file, output_video_path)
+    # Calculate the initial zoom level. Image will start at this scale (e.g., 0.8).
+    initial_zoom_level = 1.0 / max_grow_factor
+    
+    # Define the end zoom level, which is 1.0 (image fills its designated space).
+    zoom_end_level = 1.0
+    
+    # Calculate total frames for the zoompan duration parameter.
+    total_frames = int(duration * frame_rate)
+
+    timestamp = datetime.now().isoformat().replace(":", "-").replace(".", "-")
+    input_image = os.path.join(CLIP_DIR, f"{timestamp}.jpg")
+    output_video = os.path.join(CLIP_DIR, f"{timestamp}.mp4")
+
+    # Add files to cleanup in background task
+    files_to_delete = [input_image, output_video]
+    background_tasks.add_task(delete_files, files_to_delete, delay=3600)
+    logger.info(f"Scheduled cleanup for {files_to_delete}")
 
     try:
-        # 1. Download the image
-        print(f"Downloading image from {request.image_url} to {image_temp_path}")
+        # Download image using httpx (asynchronous)
+        logger.info(f"Downloading image from {image_url} to {input_image}")
         async with httpx.AsyncClient() as client:
-            response = await client.get(request.image_url)
+            response = await client.get(image_url)
             response.raise_for_status() # Raise an exception for bad status codes
-            with open(image_temp_path, "wb") as f:
+            with open(input_image, "wb") as f:
                 f.write(response.content)
-        print("Image downloaded successfully.")
+        logger.info(f"Image downloaded successfully to {input_image}. File size: {os.path.getsize(input_image)} bytes.")
 
-        # 2. FFmpeg command for zoompan effect
-        # We target a common TikTok resolution like 720x1280.
-        # Since input is 576x1024 (9:16), scaling to 720x1280 (also 9:16)
-        # maintains aspect ratio. The zoompan filter then applies the motion.
-        
-        # 'zoom' parameter in zoompan filter expressions:
-        # starts at 1 and increases by zoom_speed * 'on' (frame number).
-        # We use min(..., 1.5) to cap the zoom at 1.5x the original size. Adjust as needed.
-        
-        ffmpeg_command = [
-            "-loop", "1",  # Loop the single input image indefinitely
-            "-i", image_temp_path,
-            "-vf",
-            # Scale the input image to fill the target resolution, maintaining aspect ratio.
-            # 'force_original_aspect_ratio=increase' ensures it fills without black bars
-            # on the shorter dimension, so zoompan has content to work with.
-            f"scale={TIKTOK_REELS_WIDTH}:{TIKTOK_REELS_HEIGHT}:force_original_aspect_ratio=increase,"
-            f"zoompan=z='min(zoom+{request.zoom_speed}*on,1.5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s='{TIKTOK_REELS_WIDTH}x{TIKTOK_REELS_HEIGHT}'",
-            "-pix_fmt", "yuv420p",  # Essential for broad video player compatibility
-            "-r", str(request.frame_rate),
-            "-t", str(request.length),
-            "-c:v", "libx264",
-            "-preset", "medium",    # 'medium' offers a good balance; 'fast'/'superfast' for speed, 'slow' for quality
-            "-crf", "23",            # Constant Rate Factor: 0 (lossless) to 51 (worst quality). 23 is a good default.
-            "-movflags", "+faststart", # Optimizes for web streaming
-            "-y", # Overwrite output file if it exists
-            output_video_path
+        # Validate if the image was downloaded successfully
+        if not os.path.exists(input_image) or os.path.getsize(input_image) < 1024:
+            logger.error(f"Downloaded image is invalid or too small: {input_image}")
+            raise HTTPException(status_code=422, detail="Invalid image or download failed")
+
+        # FFmpeg filter complex for a stable "grow" effect without cutting, outputting 720x1280.
+        zoom_expr = (
+            f"scale=8000:-1,"
+            f"zoompan=z='({initial_zoom_level:.6f} + (({zoom_end_level:.6f} - {initial_zoom_level:.6f}) / {duration:.6f}) * t)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={output_width}x{output_height}"
+        )
+        logger.debug(f"FFmpeg zoompan filter expression: {zoom_expr}")
+
+        # FFmpeg command to create the video clip
+        cmd = [
+            "-y", # Overwrite output files without asking
+            "-loop", "1", # Loop the input image
+            "-i", input_image,
+            "-vf", zoom_expr, # Apply the combined video filter graph
+            "-t", str(duration), # Set the duration of the output video
+            "-r", str(frame_rate), # Set the frame rate
+            "-pix_fmt", "yuv420p", # Set pixel format for broader compatibility
+            "-c:v", "libx264", # Explicitly set video codec for web compatibility
+            "-preset", "medium", # Good balance of speed and quality
+            "-crf", "23", # Constant Rate Factor for quality control
+            "-movflags", "+faststart", # For web streaming optimization
+            output_video
         ]
 
-        print(f"Executing FFmpeg command for clip generation: {' '.join(ffmpeg_command)}")
-        await run_ffmpeg_command(ffmpeg_command)
-        print(f"Video clip generated: {output_video_path}")
-
-        # Return the generated video file
-        return FileResponse(output_video_path, media_type="video/mp4", filename=os.path.basename(output_video_path))
-
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"Failed to download image: {e.response.status_code} - {e.response.text}")
-    except Exception as e:
-        print(f"Unhandled error in generate_clip_endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
+        await run_ffmpeg_command(cmd)
+        logger.info(f"Video clip generated: {output_video}. File exists: {os.path.exists(output_video)}. File size: {os.path.getsize(output_video)} bytes.")
 
 
-# --- Endpoint 2: Process Clips (Join, Subtitles, Voice-over) ---
+        # Check if video generation was successful
+        if not os.path.exists(output_video) or os.path.getsize(output_video) == 0:
+            logger.error(f"Output video file not created or is empty: {output_video}")
+            raise HTTPException(status_code=500, detail="Video generation failed: Output file not created or is empty.")
 
-@app.post("/process-clips/", summary="Join clips, add subtitles, and voice-over")
-async def process_clips_endpoint(request: ProcessClipsRequest, background_tasks: BackgroundTasks):
-    """
-    Takes multiple video clips, concatenates them, overlays subtitles, and adds a voice-over audio track.
-
-    - **clips**: A list of `ClipInfo` specifying the video files to join.
-      (Note: These files must be accessible on the server where the API runs).
-    - **voice_over_audio_url**: Optional URL to an audio file for voice-over.
-    - **subtitles**: Optional list of `SubtitleEntry` objects for text overlays.
-    - **output_filename**: Optional name for the final output video file.
-    """
-    
-    # Generate unique IDs for temporary files
-    process_id = str(uuid.uuid4())
-    concat_list_path = os.path.join(TEMP_FILES_DIR, f"concat_list_{process_id}.txt")
-    voice_over_temp_path = None
-    output_video_path = os.path.join(TEMP_FILES_DIR, request.output_filename if request.output_filename else f"final_reel_{process_id}.mp4")
-
-    # Add files to cleanup in background
-    background_tasks.add_task(cleanup_file, concat_list_path)
-    if voice_over_temp_path: # Will be added after download
-        background_tasks.add_task(cleanup_file, voice_over_temp_path)
-    background_tasks.add_task(cleanup_file, output_video_path)
-
-
-    try:
-        # 1. Download voice-over audio if provided
-        if request.voice_over_audio_url:
-            voice_over_temp_path = os.path.join(TEMP_FILES_DIR, f"voiceover_{process_id}.mp3")
-            print(f"Downloading voice-over from {request.voice_over_audio_url} to {voice_over_temp_path}")
-            async with httpx.AsyncClient() as client:
-                response = await client.get(request.voice_over_audio_url)
-                response.raise_for_status()
-                with open(voice_over_temp_path, "wb") as f:
-                    f.write(response.content)
-            background_tasks.add_task(cleanup_file, voice_over_temp_path) # Add to cleanup list after successful download
-            print("Voice-over downloaded successfully.")
-
-        # 2. Create a concat list file for the FFmpeg concat demuxer
-        # IMPORTANT: Ensure 'clips[i].filename' points to files accessible by the FFmpeg process.
-        # If they are remote URLs, you need to download them here first and update filename.
-        print(f"Creating concat list file: {concat_list_path}")
-        with open(concat_list_path, "w") as f:
-            for clip in request.clips:
-                # Basic validation: ensure clip file exists (or is a valid URL if downloading)
-                if not os.path.exists(clip.filename):
-                    # In a real app, you'd likely download remote clips here
-                    raise HTTPException(status_code=400, detail=f"Clip file not found: {clip.filename}. Please ensure all clip files are accessible on the server.")
-                f.write(f"file '{clip.filename}'\n")
-        print("Concat list file created.")
-
-        # Base FFmpeg command for concatenation
-        # Using concat demuxer which is efficient for joining same-format clips (stream copy)
-        # If clips have different formats/resolutions, you'd need the `concat` *filter*
-        # and potentially `scale` filters for each input.
-        ffmpeg_inputs = ["-f", "concat", "-safe", "0", "-i", concat_list_path]
-        
-        # Determine video and audio mapping and filter complex
-        filter_complex_parts = []
-        map_options = []
-        
-        # Start with the concatenated video and audio streams
-        # [0:v] and [0:a] refer to the video and audio from the concatenated input (concat_list_path)
-        current_video_input = "[0:v]"
-        current_audio_input = "[0:a]"
-        input_index_counter = 1 # For voice-over audio
-
-        # Add voice-over if present
-        if voice_over_temp_path:
-            ffmpeg_inputs.extend(["-i", voice_over_temp_path])
-            # Mix original audio with voice-over
-            filter_complex_parts.append(f"{current_audio_input}[{input_index_counter}:a]amix=inputs=2:duration=longest[mixed_audio]")
-            current_audio_input = "[mixed_audio]"
-            input_index_counter += 1 # Increment for next potential input
-
-        # Add subtitles using drawtext filter
-        if request.subtitles:
-            # We need to apply drawtext after concatenation.
-            # Each subtitle entry gets its own drawtext filter, enabled by its time range.
-            # Using 'x=(w-text_w)/2' and 'y=h-50' for centered bottom text.
-            for i, sub in enumerate(request.subtitles):
-                # You might need to escape single quotes in subtitle text if they appear
-                escaped_text = sub.text.replace("'", "'\\''")
-                
-                # Each drawtext filter applies to the current video input and outputs a new video stream.
-                # So we chain them.
-                if i == 0: # First subtitle applies to the concatenated video
-                    filter_complex_parts.append(
-                        f"{current_video_input}drawtext=text='{escaped_text}':x=(w-text_w)/2:y=h-50:fontsize=48:fontcolor=white:borderw=2:bordercolor=black:enable='between(t,{sub.start_time},{sub.end_time})'[v_temp{i}]"
-                    )
-                else: # Subsequent subtitles apply to the output of the previous drawtext
-                    filter_complex_parts.append(
-                        f"[v_temp{i-1}]drawtext=text='{escaped_text}':x=(w-text_w)/2:y=h-50:fontsize=48:fontcolor=white:borderw=2:bordercolor=black:enable='between(t,{sub.start_time},{sub.end_time})'[v_temp{i}]"
-                    )
-            current_video_input = f"[v_temp{len(request.subtitles)-1}]" # Last video output of the chain
-
-        # Final mapping
-        map_options.append(f"-map {current_video_input}")
-        map_options.append(f"-map {current_audio_input}")
-        
-        final_command = []
-        final_command.extend(ffmpeg_inputs)
-
-        if filter_complex_parts:
-            final_command.extend(["-filter_complex", ";".join(filter_complex_parts)])
-        
-        final_command.extend(map_options)
-        
-        # Output options
-        final_command.extend([
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "192k", # Audio bitrate
-            "-movflags", "+faststart",
-            "-y",
-            output_video_path
-        ])
-
-        print(f"Executing FFmpeg command for clip processing: {' '.join(final_command)}")
-        await run_ffmpeg_command(final_command)
-        print(f"Video processed: {output_video_path}")
-
-        # Return the generated video file
-        return FileResponse(output_video_path, media_type="video/mp4", filename=os.path.basename(output_video_path))
+        response_payload = {
+            "clip_path": output_video,
+            "public_url": f"/static/clips/{os.path.basename(output_video)}"
+        }
+        logger.info(f"Successfully generated clip. Response: {response_payload}")
+        return response_payload
 
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"Failed to download audio: {e.response.status_code} - {e.response.text}")
-    except ValueError as e: # Catch Pydantic validation errors explicitly
-        raise HTTPException(status_code=422, detail=f"Validation error: {e}")
-    except HTTPException: # Re-raise FastAPI's own HTTPExceptions
+        logger.error(f"HTTP error during image download: {e.response.status_code} - {e.response.text}", exc_info=True)
+        raise HTTPException(status_code=e.response.status_code, detail=f"Failed to download image from URL: {e.response.status_code} - {e.response.text}")
+    except HTTPException: # Re-raise FastAPI HTTPExceptions
         raise
     except Exception as e:
-        print(f"Unhandled error in process_clips_endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
+        logger.exception(f"An unhandled error occurred during clip generation: {e}") # exc_info=True logs traceback
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred during clip generation: {e}")
 
-# --- Root Endpoint ---
+
+# --- Pydantic Models for Request Body ---
+class ClipInfo(BaseModel):
+    filename: str = Field(..., description="Path/filename of the existing video clip.")
+
+class SubtitleEntry(BaseModel):
+    text: str = Field(..., min_length=1, description="The text content of the subtitle.")
+    start_time: float = Field(..., ge=0, description="Start time of the subtitle in seconds (relative to the final video).")
+    end_time: float = Field(..., gt=0, description="End time of the subtitle in seconds (relative to the final video).")
+
+    # Custom validation (pydantic v2 needs model_validator for cross-field validation)
+    @model_validator(mode='after')
+    def check_end_time(self) -> 'SubtitleEntry':
+        if self.end_time <= self.start_time:
+            raise ValueError("end_time must be greater than start_time")
+        return self
+
+class ProcessClipsRequest(BaseModel):
+    clips: List[ClipInfo] = Field(..., min_items=1, description="List of video clips to be concatenated.")
+    audio_url: Optional[str] = Field(None, description="URL of the audio file to use for the voice-over.")
+    captions: List[SubtitleEntry] = Field([], description="List of subtitle entries to overlay on the video.")
+    output_filename: Optional[str] = Field(None, description="Desired name for the output video file. If not provided, a UUID will be generated.")
+
+
+@app.post("/join-clips", summary="Join clips, add audio, and captions")
+async def join_clips_endpoint(request_data: ProcessClipsRequest, background_tasks: BackgroundTasks):
+    """
+    Joins multiple video clips, optionally adds an audio track and captions,
+    and outputs a final video.
+    """
+    logger.info(f"Received request to join clips.")
+    
+    timestamp = datetime.now().isoformat().replace(":", "-").replace(".", "-")
+    concat_txt_path = os.path.join(FINAL_DIR, f"concat_{timestamp}.txt")
+    joined_video_path = os.path.join(FINAL_DIR, f"joined_{timestamp}.mp4")
+    temp_audio_path = os.path.join(FINAL_DIR, f"audio_{timestamp}.mp3")
+    output_video_basename = request_data.output_filename if request_data.output_filename else f"final_reel_{uuid.uuid4()}.mp4"
+    final_video_path = os.path.join(FINAL_DIR, output_video_basename)
+
+    # Add files to cleanup
+    files_to_delete = [concat_txt_path, joined_video_path]
+    if request_data.audio_url:
+        files_to_delete.append(temp_audio_path)
+    files_to_delete.append(final_video_path) # Always clean up final output
+    
+    # NOTE: If clips in request_data.clips are local files created by generate-clip,
+    # they should ideally be cleaned up by the generate-clip endpoint's background task.
+    # Adding them here would lead to double scheduling or potential issues if generate-clip
+    # is run separately. For a robust system, track files with unique IDs or a dedicated
+    # cleanup service.
+
+    background_tasks.add_task(delete_files, files_to_delete, delay=3600)
+    logger.info(f"Scheduled cleanup for {files_to_delete}")
+
+    try:
+        # 1. Create a concat file listing all clips for FFmpeg concatenation
+        logger.info(f"Creating concat list file: {concat_txt_path}")
+        with open(concat_txt_path, "w") as f:
+            for clip_info in request_data.clips:
+                if not os.path.exists(clip_info.filename):
+                    logger.error(f"Input clip file not found: {clip_info.filename}")
+                    raise HTTPException(status_code=404, detail=f"Input clip file not found: {clip_info.filename}")
+                f.write(f"file '{clip_info.filename}'\n")
+        logger.info("Concat list file created.")
+
+        # 2. Concatenate clips using FFmpeg's concat demuxer
+        concat_cmd = ["-f", "concat", "-safe", "0", "-i", concat_txt_path, "-c", "copy", joined_video_path]
+        await run_ffmpeg_command(concat_cmd)
+        logger.info(f"Clips concatenated to: {joined_video_path}")
+
+        current_video_input_path = joined_video_path
+        
+        # 3. Handle audio (voice-over)
+        if request_data.audio_url:
+            logger.info(f"Downloading audio from {request_data.audio_url} to {temp_audio_path}")
+            async with httpx.AsyncClient() as client:
+                response = await client.get(request_data.audio_url)
+                response.raise_for_status()
+                with open(temp_audio_path, "wb") as f:
+                    f.write(response.content)
+            logger.info(f"Audio downloaded successfully to {temp_audio_path}. File size: {os.path.getsize(temp_audio_path)} bytes.")
+
+            # Mix video's original audio with voice-over audio
+            amix_cmd = [
+                "-i", current_video_input_path,
+                "-i", temp_audio_path,
+                "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest[aout]",
+                "-map", "0:v",
+                "-map", "[aout]",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
+                final_video_path # Output to final path immediately
+            ]
+            await run_ffmpeg_command(amix_cmd)
+            logger.info(f"Audio mixed and output to: {final_video_path}")
+            current_video_input_path = final_video_path # Next step operates on this output
+        else:
+            # If no audio URL, and no captions to apply yet, the joined_video_path is the current base
+            # We'll explicitly copy it to final_video_path if no further processing happens.
+            pass
+
+        # 4. Add captions (if any) using drawtext filter
+        if request_data.captions:
+            subtitled_video_path = final_video_path # Assume final_video_path is the base, re-assign if needed
+            
+            # If audio was mixed, current_video_input_path is already final_video_path.
+            # If no audio was mixed, current_video_input_path is joined_video_path.
+            # We need to ensure the audio stream from the current input is mapped.
+            
+            # Build drawtext filter chain
+            drawtext_filters = []
+            for i, caption in enumerate(request_data.captions):
+                # Escape single quotes and backslashes for FFmpeg string
+                escaped_text = caption.text.replace("'", "'\\''").replace("\\", "\\\\")
+                
+                drawtext_filters.append(
+                    f"drawtext=text='{escaped_text}':x=(w-text_w)/2:y=h-50:fontsize=48:fontcolor=white:borderw=2:bordercolor=black:enable='between(t,{caption.start_time},{caption.end_time})'"
+                )
+            
+            # Chain multiple drawtext filters
+            # [0:v] refers to the video stream from the first input (current_video_input_path)
+            # [0:a] refers to the audio stream from the first input (current_video_input_path)
+            complex_filter_chain = f"[0:v]{drawtext_filters[0]}[vtemp0]"
+            for i in range(1, len(drawtext_filters)):
+                complex_filter_chain += f";[vtemp{i-1}]{drawtext_filters[i]}[vtemp{i}]"
+            
+            # Final output from the filter chain
+            final_video_stream = f"[vtemp{len(drawtext_filters)-1}]"
+
+            caption_cmd = [
+                "-i", current_video_input_path, # This input has the video (and potentially mixed audio)
+                "-filter_complex", complex_filter_chain,
+                "-map", final_video_stream, # Map the final video stream from the filter_complex
+                "-map", "0:a", # Map the audio stream from the input
+                "-c:v", "libx264", "-preset", "medium", "-crf", "23", # Re-encode video
+                "-c:a", "aac", "-b:a", "192k", # Encode audio
+                subtitled_video_path # Output to the subtitled path
+            ]
+            await run_ffmpeg_command(caption_cmd)
+            logger.info(f"Captions added and output to: {subtitled_video_path}")
+            final_video_path = subtitled_video_path # Update the final path
+
+        # 5. Finalize the video path if no audio/captions steps changed it
+        if not request_data.audio_url and not request_data.captions:
+            # If no audio mixing or captions were applied, the joined_video_path is the final product.
+            # We need to copy it to the designated final_video_path.
+            if joined_video_path != final_video_path: # Ensure we don't copy if it's already the same
+                shutil.copy(joined_video_path, final_video_path)
+            logger.info(f"No additional processing, final video is copied from joined clips: {final_video_path}")
+
+
+        # Final check if the output video was created
+        if not os.path.exists(final_video_path) or os.path.getsize(final_video_path) == 0:
+            logger.error(f"Final video file not created or is empty: {final_video_path}")
+            raise HTTPException(status_code=500, detail="Final video rendering failed: Output file not created or is empty.")
+
+        response_payload = {"video_url": f"/static/final/{os.path.basename(final_video_path)}"}
+        logger.info(f"Successfully processed clips. Response: {response_payload}")
+        return response_payload
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error during audio download: {e.response.status_code} - {e.response.text}", exc_info=True)
+        raise HTTPException(status_code=e.response.status_code, detail=f"Failed to download audio from URL: {e.response.status_code} - {e.response.text}")
+    except HTTPException: # Re-raise FastAPI HTTPExceptions
+        raise
+    except Exception as e:
+        logger.exception(f"An unhandled error occurred during clip processing: {e}")
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred during clip processing: {e}")
+
+# Root endpoint
 @app.get("/", summary="Root endpoint")
 async def read_root():
+    logger.info("Root endpoint accessed.")
     return {"message": "Welcome to the TikTok Video Generator API! Visit /docs for API documentation."}
