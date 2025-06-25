@@ -36,10 +36,10 @@ def delete_files(paths: List[str], delay=3600):
 @app.post("/generate-clip")
 async def generate_clip(request: Request, background_tasks: BackgroundTasks):
     """
-    Generates a video clip from an image with a subtle zoom effect,
+    Generates a video clip from an image with a subtle "grow" effect,
     formatted for vertical platforms like TikTok/Reels.
-    The entire image will be visible in the initial frame, with black bars added if its aspect ratio doesn't match.
-    The zoom effect will then apply to this framed image.
+    The entire image will be visible throughout the clip, starting slightly smaller
+    and smoothly expanding to fill the 720x1280 frame without any cropping.
     """
     try:
         data = await request.json()
@@ -47,11 +47,21 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         duration = float(data.get("length", 5))
         frame_rate = int(data.get("frame_rate", 25))
         
-        # Zoom parameters for subtle effect
-        # Default zoom speed for a smooth, slow zoom
-        zoom_speed_param = float(data.get("zoom_speed", 0.0002)) # Even slower zoom
-        # Default max zoom to 1.2x, adjustable via 'max_zoom' in request body
-        max_zoom_param = float(data.get("max_zoom", 1.2)) # Set default max zoom to 1.2x
+        # max_zoom_param now represents how much the image "grows" from its initial state.
+        # If max_zoom is 1.25, it means the image will grow to be 1.25 times its starting size.
+        # The starting size is calculated to ensure the final size fills the frame.
+        max_grow_factor = float(data.get("max_zoom", 1.25)) # Default grow factor to 1.25x
+
+        # Calculate the initial scale relative to the final 720x1280 frame.
+        # For a "grow" effect without cutting, the final state should be 720x1280.
+        # So, the initial state is 720/max_grow_factor by 1280/max_grow_factor.
+        initial_scale_width = 720 / max_grow_factor
+        initial_scale_height = 1280 / max_grow_factor
+        
+        # Calculate the increase in size per frame
+        total_frames = int(duration * frame_rate)
+        width_increase_per_frame = (720 - initial_scale_width) / total_frames if total_frames > 0 else 0
+        height_increase_per_frame = (1280 - initial_scale_height) / total_frames if total_frames > 0 else 0
 
         if not image_url:
             raise HTTPException(status_code=400, detail="Missing image_url")
@@ -67,28 +77,32 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         if not os.path.exists(input_image) or os.path.getsize(input_image) < 1024:
             raise HTTPException(status_code=422, detail="Invalid image or download failed")
 
-        # FFmpeg filter complex for zoom, scaling, and padding for Reels format.
+        # FFmpeg filter complex for a "grow" effect (subtle zoom without cutting).
         # This filter chain aims to:
-        # 1. Ensure the image is scaled to fit fully within the 720x1280 frame without cropping (letterbox/pillarbox if needed).
-        # 2. Then, apply a subtle zoom effect to this *already framed* video.
+        # 1. Scale the input image to a high intermediate resolution for quality during transformations.
+        #    This is applied first so that subsequent scaling operations have high-quality pixel data to work with.
+        # 2. Apply a dynamic `scale` filter that changes the image's dimensions over time.
+        #    - `w` and `h` are dynamically calculated based on `initial_scale_width/height` and `width/height_increase_per_frame`.
+        #      `t` is the current timestamp (in seconds).
+        #    - `force_original_aspect_ratio=increase`: This is crucial. It ensures that as the image grows,
+        #      its aspect ratio is maintained, and it scales to *at least* the calculated width/height,
+        #      potentially exceeding one dimension if necessary to maintain aspect ratio.
+        # 3. Finally, `scale` the result to exactly 720x1280, maintaining aspect ratio and adding black bars.
+        #    This *final* scale ensures the video output is always 720x1280, and because the previous step
+        #    ensured the image never "cropped itself," this final step merely fits it into the frame.
+        # 4. `pad` the output to ensure exact 720x1280 dimensions, with black bars if the aspect ratio
+        #    didn't perfectly match after the previous scaling.
         zoom_expr = (
-            # Scale image to fit within 720x1280, maintaining aspect ratio.
-            # This calculates the appropriate scaling factor to ensure the entire image is visible,
-            # fitting either its width or height to the target, and then adjusts the other dimension
-            # to maintain aspect ratio.
-            "scale=w='min(720,iw*(1280/ih))':h='min(1280,ih*(720/iw))'," 
-            # Pad the scaled image to exactly 720x1280, centering it and filling with black.
-            # This guarantees the full image is visible within the 9:16 frame, surrounded by black
-            # if its aspect ratio doesn't perfectly match.
-            "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,"
-            # Apply the zoompan effect to the already framed and padded image.
-            # z: zoom factor. `min(zoom+{zoom_speed_param},{max_zoom_param})` ensures a gradual zoom
-            #    up to the specified maximum.
-            # x, y: defines the center of the zoom. Here, it maintains the center of the image
-            #    relative to the zoomed-in portion.
-            # d: duration of the zoompan effect in frames.
-            f"zoompan=z='min(zoom+{zoom_speed_param},{max_zoom_param})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={int(duration * frame_rate)}"
+            # 1. Scale input to a high resolution for quality before dynamic scaling
+            "scale=w=iw*min(4000/iw\\,4000/ih):h=ih*min(4000/iw\\,4000/ih),"
+            # 2. Dynamic scale (the "grow" effect). Calculates target width/height based on time 't'
+            f"scale=w='{initial_scale_width} + ({width_increase_per_frame}*t)':h='{initial_scale_height} + ({height_increase_per_frame}*t)':force_original_aspect_ratio=increase,"
+            # 3. Final scale to fit 720x1280 maintaining aspect ratio (will not crop image content)
+            "scale=720:1280:force_original_aspect_ratio=decrease,"
+            # 4. Pad to fill 720x1280 frame with black bars if aspect ratio difference exists
+            "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"
         )
+
 
         # FFmpeg command to create the video clip
         cmd = [
