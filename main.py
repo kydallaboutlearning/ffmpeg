@@ -36,6 +36,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         duration = float(data.get("length", 5))
         frame_rate = int(data.get("frame_rate", 25))
         zoom_speed = float(data.get("zoom_speed", 0.003))
+        frame_count = int(duration * frame_rate)
 
         if not image_url:
             raise HTTPException(status_code=400, detail="Missing image_url")
@@ -50,7 +51,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
 
         # TikTok-style vertical formatting with animated zoom
         zoom_expr = (
-            f"zoompan=z='if(lte(zoom,1.0),1.2,zoom+{zoom_speed})':d=1:"
+            f"zoompan=z='if(lte(zoom,1.0),1.2,zoom+{zoom_speed})':d=1:s={frame_count}:"
             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',fps={frame_rate},"
             f"scale=w=720:h=-1,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"
         )
@@ -58,7 +59,6 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         cmd = [
             "ffmpeg", "-y", "-i", input_image,
             "-vf", zoom_expr,
-            "-t", str(duration),
             "-pix_fmt", "yuv420p", output_video
         ]
 
@@ -70,7 +70,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
 
         background_tasks.add_task(delete_files, [input_image, output_video], delay=3600)
 
-        return {"clip_path": output_video, "public_url": f"https://image-to-video-api-qkjd.onrender.com/static/clips/{os.path.basename(output_video)}"}
+        return {"clip_path": output_video, "public_url": f"/static/clips/{os.path.basename(output_video)}"}
 
     except HTTPException as http_err:
         raise http_err
