@@ -51,11 +51,17 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         if not os.path.exists(input_image) or os.path.getsize(input_image) < 1024:
             raise HTTPException(status_code=422, detail="Invalid image or download failed")
 
-        # Final zoom filter: subtle zoom in, pad to vertical 720x1280
+        # Final zoom filter: upscale for clean zoom, then animate zoompan, then pad for TikTok/reels format
         zoom_expr = (
-            f"scale=720:-1,"
-            f"zoompan=z='zoom+{zoom_speed}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
-            f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"
+    f"scale=8000:-1,"  # upscale first for zoom clarity
+    f"zoompan=z='min(zoom+{zoom_speed},1.5)':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # zoom and pan
+    f"scale=720:1280:force_original_aspect_ratio=decrease,"  # scale to fit without cropping
+    f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"  # pad to vertical TikTok/reels size
+)':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # zoom and pan
+    f"scale=720:1280:force_original_aspect_ratio=decrease,"  # scale to fit 720x1280 without crop
+    f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"  # pad if needed to fill frame
+)':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # zoom and pan
+            f"scale=720:-1,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"  # downscale + pad to TikTok format
         )
 
         cmd = [
@@ -78,7 +84,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
 
         return {
             "clip_path": output_video,
-            "public_url": f"/static/clips/{os.path.basename(output_video)}"
+            "public_url": f"https://image-to-video-api-qkjd.onrender.com/static/clips/{os.path.basename(output_video)}"
         }
 
     except subprocess.CalledProcessError as err:
