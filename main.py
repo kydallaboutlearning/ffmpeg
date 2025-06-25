@@ -37,9 +37,9 @@ def delete_files(paths: List[str], delay=3600):
 async def generate_clip(request: Request, background_tasks: BackgroundTasks):
     """
     Generates a video clip from an image with a subtle "grow" effect,
-    formatted for vertical platforms like TikTok/Reels.
-    The entire image will be visible throughout the clip, starting slightly smaller
-    and smoothly expanding to fill the 720x1280 frame without any cropping.
+    formatted for a standard 9:16 Reels output (720x1280).
+    The entire input image will be visible throughout the clip, starting slightly smaller
+    and smoothly expanding to fill that 9:16 frame without any cropping of the original image content.
     """
     try:
         data = await request.json()
@@ -47,21 +47,24 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         duration = float(data.get("length", 5))
         frame_rate = int(data.get("frame_rate", 25))
         
-        # max_zoom_param now represents how much the image "grows" from its initial state.
-        # If max_zoom is 1.25, it means the image will grow to be 1.25 times its starting size.
-        # The starting size is calculated to ensure the final size fills the frame.
+        # --- Output video resolution for standard Reels (9:16 aspect ratio) ---
+        output_width = 720
+        output_height = 1280
+
+        # max_grow_factor defines how much the image will *appear* to grow relative to its initial size.
+        # If max_grow_factor is 1.25, the image starts at 1/1.25 (0.8) scale relative to its final
+        # fitted size within the 720x1280 frame, and grows to 1.0 (filling that fitted size).
         max_grow_factor = float(data.get("max_zoom", 1.25)) # Default grow factor to 1.25x
 
-        # Calculate the initial scale relative to the final 720x1280 frame.
-        # For a "grow" effect without cutting, the final state should be 720x1280.
-        # So, the initial state is 720/max_grow_factor by 1280/max_grow_factor.
-        initial_scale_width = 720 / max_grow_factor
-        initial_scale_height = 1280 / max_grow_factor
+        # Calculate the initial zoom level for the zoompan filter.
+        # Image will start at this scale (e.g., 0.8) and grow to 1.0.
+        initial_zoom_level = 1.0 / max_grow_factor
         
-        # Calculate the increase in size per frame
+        # Calculate the speed at which the zoom (growth) happens per second.
+        # It goes from initial_zoom_level to 1.0 over the clip's duration.
+        zoom_speed_per_second = (1.0 - initial_zoom_level) / duration
+        
         total_frames = int(duration * frame_rate)
-        width_increase_per_frame = (720 - initial_scale_width) / total_frames if total_frames > 0 else 0
-        height_increase_per_frame = (1280 - initial_scale_height) / total_frames if total_frames > 0 else 0
 
         if not image_url:
             raise HTTPException(status_code=400, detail="Missing image_url")
@@ -77,32 +80,26 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         if not os.path.exists(input_image) or os.path.getsize(input_image) < 1024:
             raise HTTPException(status_code=422, detail="Invalid image or download failed")
 
-        # FFmpeg filter complex for a "grow" effect (subtle zoom without cutting).
-        # This filter chain aims to:
-        # 1. Scale the input image to a high intermediate resolution for quality during transformations.
-        #    This is applied first so that subsequent scaling operations have high-quality pixel data to work with.
-        # 2. Apply a dynamic `scale` filter that changes the image's dimensions over time.
-        #    - `w` and `h` are dynamically calculated based on `initial_scale_width/height` and `width/height_increase_per_frame`.
-        #      `t` is the current timestamp (in seconds).
-        #    - `force_original_aspect_ratio=increase`: This is crucial. It ensures that as the image grows,
-        #      its aspect ratio is maintained, and it scales to *at least* the calculated width/height,
-        #      potentially exceeding one dimension if necessary to maintain aspect ratio.
-        # 3. Finally, `scale` the result to exactly 720x1280, maintaining aspect ratio and adding black bars.
-        #    This *final* scale ensures the video output is always 720x1280, and because the previous step
-        #    ensured the image never "cropped itself," this final step merely fits it into the frame.
-        # 4. `pad` the output to ensure exact 720x1280 dimensions, with black bars if the aspect ratio
-        #    didn't perfectly match after the previous scaling.
+        # FFmpeg filter complex for a stable "grow" effect without cutting, outputting 720x1280.
+        # The order of filters is crucial for preventing cutting:
+        # 1. `scale=8000:-1`: Upscales the input image to 8000px width (maintaining aspect ratio)
+        #    for higher quality during the zoompan effect. This is similar to your reference command.
+        # 2. `zoompan`: This filter applies the actual dynamic scaling (the "grow" effect).
+        #    - `z='min({initial_zoom_level} + t*{zoom_speed_per_second}, 1.0)'`:
+        #      The zoom factor starts at `initial_zoom_level` (e.g., 0.8) and increases linearly with `t` (time in seconds)
+        #      up to a maximum of `1.0`. This creates the "grow" effect from a smaller size to its full fitted size.
+        #    - `x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'`: These expressions keep the center of the image
+        #      aligned with the center of the output frame as it grows.
+        #    - `d={total_frames}`: The duration of the zoompan effect in frames.
+        #    - `s={output_width}x{output_height}`: This explicitly sets the output
+        #      resolution of the zoompan filter itself to 720x1280. Since your 9:16 image (576x1024) is put into this
+        #      9:16 frame, it will be scaled to fit perfectly without any pillarboxing/letterboxing here.
+        # 3. No further `scale` or `pad` filters are needed here, as `zoompan`'s `s` parameter directly outputs
+        #    the desired size and handles the aspect ratio fitting.
         zoom_expr = (
-            # 1. Scale input to a high resolution for quality before dynamic scaling
-            "scale=w=iw*min(4000/iw\\,4000/ih):h=ih*min(4000/iw\\,4000/ih),"
-            # 2. Dynamic scale (the "grow" effect). Calculates target width/height based on time 't'
-            f"scale=w='{initial_scale_width} + ({width_increase_per_frame}*t)':h='{initial_scale_height} + ({height_increase_per_frame}*t)':force_original_aspect_ratio=increase,"
-            # 3. Final scale to fit 720x1280 maintaining aspect ratio (will not crop image content)
-            "scale=720:1280:force_original_aspect_ratio=decrease,"
-            # 4. Pad to fill 720x1280 frame with black bars if aspect ratio difference exists
-            "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"
+            f"scale=8000:-1,"  # Upscale for quality before zoompan
+            f"zoompan=z='min({initial_zoom_level} + t*{zoom_speed_per_second}, 1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={output_width}x{output_height}"
         )
-
 
         # FFmpeg command to create the video clip
         cmd = [
@@ -209,7 +206,7 @@ async def join_clips(request: Request, background_tasks: BackgroundTasks):
         return {"video_url": f"/static/final/{os.path.basename(final_video)}"}
 
     except subprocess.CalledProcessError as err:
-        # Catch errors specifically from subprocess calls (FFmpeg)
+        # Catch errors specifically from subprocess calls
         print(f"FFmpeg error details: {err.stderr.decode()}")
         raise HTTPException(status_code=500, detail=f"FFmpeg error: {err}. FFmpeg output: {err.stderr.decode()}")
     except Exception as e:
