@@ -68,22 +68,26 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
             raise HTTPException(status_code=422, detail="Invalid image or download failed")
 
         # FFmpeg filter complex for zoom, scaling, and padding for Reels format.
-        # The order of filters is crucial here:
-        # 1. Scale input image to a high intermediate resolution for better quality during zoom.
-        #    `iw*min(8000/iw,8000/ih):ih*min(8000/iw,8000/ih)` ensures it scales up to a max of 8000px on
-        #    either width or height, maintaining aspect ratio.
-        # 2. Scale the high-res image to fit exactly 720x1280 (Reels format),
-        #    maintaining aspect ratio and adding black bars if needed. This ensures the
-        #    *entire* image is visible and correctly framed *before* the zoom begins.
-        # 3. Apply the `zoompan` effect to this *already framed* image. The zoom will now
-        #    start from a state where the full image is shown and magnify from there.
-        #    `z='min(zoom+{zoom_speed_param},{max_zoom_param})'` controls the zoom level.
-        #    `d={int(duration * frame_rate)}` sets the duration of the zoom.
+        # This filter chain aims to:
+        # 1. Ensure the image is scaled to fit fully within the 720x1280 frame without cropping (letterbox/pillarbox if needed).
+        # 2. Then, apply a subtle zoom effect to this *already framed* video.
         zoom_expr = (
-            f"scale=iw*min(8000/iw,8000/ih):ih*min(8000/iw,8000/ih),"  # Upscale for quality
-            f"scale=720:1280:force_original_aspect_ratio=decrease,"    # Fit to Reels frame, no cropping
-            f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,"                  # Pad with black bars to fill Reels frame
-            f"zoompan=z='min(zoom+{zoom_speed_param},{max_zoom_param})':d={int(duration * frame_rate)}" # Apply zoom to the framed image
+            # Scale image to fit within 720x1280, maintaining aspect ratio.
+            # This calculates the appropriate scaling factor to ensure the entire image is visible,
+            # fitting either its width or height to the target, and then adjusts the other dimension
+            # to maintain aspect ratio.
+            "scale=w='min(720,iw*(1280/ih))':h='min(1280,ih*(720/iw))'," 
+            # Pad the scaled image to exactly 720x1280, centering it and filling with black.
+            # This guarantees the full image is visible within the 9:16 frame, surrounded by black
+            # if its aspect ratio doesn't perfectly match.
+            "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,"
+            # Apply the zoompan effect to the already framed and padded image.
+            # z: zoom factor. `min(zoom+{zoom_speed_param},{max_zoom_param})` ensures a gradual zoom
+            #    up to the specified maximum.
+            # x, y: defines the center of the zoom. Here, it maintains the center of the image
+            #    relative to the zoomed-in portion.
+            # d: duration of the zoompan effect in frames.
+            f"zoompan=z='min(zoom+{zoom_speed_param},{max_zoom_param})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={int(duration * frame_rate)}"
         )
 
         # FFmpeg command to create the video clip
