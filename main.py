@@ -59,11 +59,12 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         # Calculate the initial zoom level. Image will start at this scale (e.g., 0.8).
         initial_zoom_level = 1.0 / max_grow_factor
         
-        # Define the end zoom level, which is 1.0 (image fills its designated space).
-        zoom_end_level = 1.0
+        # Calculate the rate of change per second to reach zoom_end_level (1.0)
+        # from initial_zoom_level over the given duration.
+        zoom_rate_per_second = (1.0 - initial_zoom_level) / duration
         
-        # Calculate total frames for the zoompan duration parameter.
-        total_frames = int(duration * frame_rate)
+        # Total frames for the zoompan duration parameter. This dictates how long the zoom lasts.
+        total_frames_for_zoom = int(duration * frame_rate)
 
         if not image_url:
             raise HTTPException(status_code=400, detail="Missing image_url")
@@ -80,25 +81,16 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
             raise HTTPException(status_code=422, detail="Invalid image or download failed")
 
         # FFmpeg filter complex for a stable "grow" effect without cutting, outputting 720x1280.
-        # The order of filters is crucial for preventing cutting:
-        # 1. `scale=8000:-1`: Upscales the input image to 8000px width (maintaining aspect ratio)
-        #    for higher quality during the zoompan effect.
-        # 2. `zoompan`: This filter applies the actual dynamic scaling (the "grow" effect).
-        #    - `z='({initial_zoom_level:.6f} + (({zoom_end_level:.6f} - {initial_zoom_level:.6f}) / {duration:.6f}) * t)'`:
-        #      This is the linear interpolation formula for zoom. It starts at `initial_zoom_level`
-        #      and smoothly progresses towards `zoom_end_level` (1.0) over the `duration` (in seconds).
-        #      Using `:.6f` ensures clean float formatting for FFmpeg.
-        #    - `x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'`: These expressions keep the center of the image
-        #      aligned with the center of the output frame as it grows.
-        #    - `d={total_frames}`: The duration of the zoompan effect in frames.
-        #    - `s={output_width}x{output_height}`: This explicitly sets the output
-        #      resolution of the zoompan filter itself to 720x1280. Since your 9:16 image (576x1024) is put into this
-        #      9:16 frame, it will be scaled to fit perfectly without any pillarboxing/letterboxing here.
-        # 3. No further `scale` or `pad` filters are needed here, as `zoompan`'s `s` parameter directly outputs
-        #    the desired size and handles the aspect ratio fitting.
+        # 1. `zoompan`: This filter applies the actual dynamic scaling (the "grow" effect).
+        #    - `z='({initial_zoom_level:.6f} + t*{zoom_rate_per_second:.6f})'`:
+        #      The zoom factor starts at `initial_zoom_level` and increases linearly with `t` (time in seconds).
+        #      The `:.6f` formatting is crucial for FFmpeg's parser.
+        #    - `x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'`: Keep the center of the image aligned.
+        #    - `d={total_frames_for_zoom}`: The duration of the zoompan effect in frames.
+        #    - `s={output_width}x{output_height}`: Explicitly sets the output resolution of this filter.
+        #      Since the source is 9:16 and target is 9:16, it will scale perfectly.
         zoom_expr = (
-            f"scale=8000:-1,"  # Upscale for quality before zoompan
-            f"zoompan=z='({initial_zoom_level:.6f} + (({zoom_end_level:.6f} - {initial_zoom_level:.6f}) / {duration:.6f}) * t)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={output_width}x{output_height}"
+            f"zoompan=z='({initial_zoom_level:.6f} + t*{zoom_rate_per_second:.6f})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames_for_zoom}:s={output_width}x{output_height}"
         )
 
         # FFmpeg command to create the video clip
@@ -107,7 +99,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
             "-loop", "1",    # Loop the input image
             "-i", input_image,
             "-vf", zoom_expr,  # Apply the combined video filter graph
-            "-t", str(duration), # Set the duration of the output video
+            "-t", str(duration), # Set the total duration of the output video
             "-r", str(frame_rate), # Set the frame rate
             "-pix_fmt", "yuv420p", # Set pixel format for broader compatibility
             output_video
