@@ -11,11 +11,12 @@ import shutil
 
 app = FastAPI()
 
-# Ensure required directories
-os.makedirs("static/clips", exist_ok=True)
-os.makedirs("static/final", exist_ok=True)
+# Setup folders
+CLIP_DIR = "static/clips"
+FINAL_DIR = "static/final"
+os.makedirs(CLIP_DIR, exist_ok=True)
+os.makedirs(FINAL_DIR, exist_ok=True)
 
-# Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 def delete_files(paths: List[str], delay=3600):
@@ -36,29 +37,31 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         duration = float(data.get("length", 5))
         frame_rate = int(data.get("frame_rate", 25))
         zoom_speed = float(data.get("zoom_speed", 0.003))
-        frame_count = int(duration * frame_rate)
 
         if not image_url:
             raise HTTPException(status_code=400, detail="Missing image_url")
 
         timestamp = datetime.now().isoformat().replace(":", "-").replace(".", "-")
-        input_image = f"static/clips/{timestamp}.png"
-        output_video = f"static/clips/{timestamp}.mp4"
+        input_image = f"{CLIP_DIR}/{timestamp}.jpg"
+        output_video = f"{CLIP_DIR}/{timestamp}.mp4"
 
-        download = subprocess.run(["curl", "-L", image_url, "-o", input_image])
-        if download.returncode != 0 or not os.path.exists(input_image) or os.path.getsize(input_image) < 1000:
-            raise HTTPException(status_code=422, detail="Image download failed or file invalid")
+        # Download image
+        subprocess.run(["curl", "-L", image_url, "-o", input_image], check=True)
 
-        # TikTok-style vertical formatting with animated zoom
+        if not os.path.exists(input_image) or os.path.getsize(input_image) < 1024:
+            raise HTTPException(status_code=422, detail="Invalid image or download failed")
+
+        # Zoom + pad for TikTok format
         zoom_expr = (
-            f"zoompan=z='if(lte(zoom,1.0),1.2,zoom+{zoom_speed})':d=1:n={frame_count}:"
-            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',fps={frame_rate},"
-            f"scale=w=720:h=-1,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"
+            f"zoompan=z='if(lte(zoom,1.0),1.2,zoom+{zoom_speed})':d=1:"
+            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
+            f"scale=720:-1,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"
         )
 
         cmd = [
-            "ffmpeg", "-y", "-i", input_image,
+            "ffmpeg", "-y", "-loop", "1", "-i", input_image,
             "-vf", zoom_expr,
+            "-t", str(duration), "-r", str(frame_rate),
             "-pix_fmt", "yuv420p", output_video
         ]
 
@@ -70,10 +73,13 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
 
         background_tasks.add_task(delete_files, [input_image, output_video], delay=3600)
 
-        return {"clip_path": output_video, "public_url": f"https://image-to-video-api-qkjd.onrender.com/static/clips/{os.path.basename(output_video)}"}
+        return {
+            "clip_path": output_video,
+            "public_url": f"/static/clips/{os.path.basename(output_video)}"
+        }
 
-    except HTTPException as http_err:
-        raise http_err
+    except subprocess.CalledProcessError as err:
+        raise HTTPException(status_code=500, detail=f"Subprocess error: {err}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -83,59 +89,54 @@ async def join_clips(request: Request, background_tasks: BackgroundTasks):
         data = await request.json()
         clips = data.get("clips")
         audio_url = data.get("audio_url")
-        captions_file = data.get("captions_file")  # Optional
+        captions_file = data.get("captions_file")
 
-        if not clips or not isinstance(clips, list) or len(clips) < 2:
+        if not clips or not isinstance(clips, list) or len(clips) < 1:
             raise HTTPException(status_code=400, detail="Invalid or missing clips list")
 
         timestamp = datetime.now().isoformat().replace(":", "-").replace(".", "-")
-        concat_list_path = f"static/final/concat_{timestamp}.txt"
-        joined_output = f"static/final/joined_{timestamp}.mp4"
-        final_output = f"static/final/final_{timestamp}.mp4"
-        temp_audio = f"static/final/audio_{timestamp}.mp3"
+        concat_txt = f"{FINAL_DIR}/concat_{timestamp}.txt"
+        joined_video = f"{FINAL_DIR}/joined_{timestamp}.mp4"
+        final_video = f"{FINAL_DIR}/final_{timestamp}.mp4"
+        temp_audio = f"{FINAL_DIR}/audio_{timestamp}.mp3"
 
-        # Create concat file
-        with open(concat_list_path, "w") as f:
-            for clip_path in clips:
-                if not os.path.exists(clip_path):
-                    raise HTTPException(status_code=404, detail=f"Clip not found: {clip_path}")
-                f.write(f"file '{clip_path}'\n")
+        with open(concat_txt, "w") as f:
+            for clip in clips:
+                if not os.path.exists(clip):
+                    raise HTTPException(status_code=404, detail=f"Clip not found: {clip}")
+                f.write(f"file '{clip}'\n")
 
-        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", joined_output])
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", joined_video], check=True)
 
-        if not os.path.exists(joined_output):
-            raise HTTPException(status_code=500, detail="Failed to join clips")
-
-        # Download audio
         if audio_url:
-            subprocess.run(["curl", "-L", audio_url, "-o", temp_audio])
+            subprocess.run(["curl", "-L", audio_url, "-o", temp_audio], check=True)
             if not os.path.exists(temp_audio):
                 raise HTTPException(status_code=500, detail="Audio download failed")
 
             subprocess.run([
-                "ffmpeg", "-y", "-i", joined_output, "-i", temp_audio,
-                "-shortest", "-c:v", "copy", "-c:a", "aac", final_output
-            ])
+                "ffmpeg", "-y", "-i", joined_video, "-i", temp_audio,
+                "-shortest", "-c:v", "copy", "-c:a", "aac", final_video
+            ], check=True)
         else:
-            shutil.copy(joined_output, final_output)
+            shutil.copy(joined_video, final_video)
 
-        # Add subtitles if provided
         if captions_file and os.path.exists(captions_file):
-            subtitled_output = final_output.replace(".mp4", "_subtitled.mp4")
+            subtitled_video = final_video.replace(".mp4", "_subtitled.mp4")
             subprocess.run([
-                "ffmpeg", "-y", "-i", final_output,
-                "-vf", f"subtitles={captions_file}", "-c:a", "copy", subtitled_output
-            ])
-            final_output = subtitled_output
+                "ffmpeg", "-y", "-i", final_video,
+                "-vf", f"subtitles={captions_file}",
+                "-c:a", "copy", subtitled_video
+            ], check=True)
+            final_video = subtitled_video
 
-        if not os.path.exists(final_output):
-            raise HTTPException(status_code=500, detail="Final video rendering failed")
+        if not os.path.exists(final_video):
+            raise HTTPException(status_code=500, detail="Final rendering failed")
 
-        background_tasks.add_task(delete_files, [concat_list_path, joined_output, temp_audio, *clips], delay=3600)
+        background_tasks.add_task(delete_files, [concat_txt, joined_video, temp_audio, *clips], delay=3600)
 
-        return {"video_url": f"/static/final/{os.path.basename(final_output)}"}
+        return {"video_url": f"/static/final/{os.path.basename(final_video)}"}
 
-    except HTTPException as http_err:
-        raise http_err
+    except subprocess.CalledProcessError as err:
+        raise HTTPException(status_code=500, detail=f"FFmpeg error: {err}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
