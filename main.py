@@ -38,13 +38,19 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
     """
     Generates a video clip from an image with a subtle zoom effect,
     formatted for vertical platforms like TikTok/Reels.
+    The entire image will be visible, with black bars added if its aspect ratio doesn't match.
     """
     try:
         data = await request.json()
         image_url = data.get("image_url")
         duration = float(data.get("length", 5))
         frame_rate = int(data.get("frame_rate", 25))
-        zoom_speed = float(data.get("zoom_speed", 0.001))  # very subtle zoom
+        
+        # Reintroducing zoom parameters for subtle effect
+        # Default zoom speed for a smooth, slow zoom
+        zoom_speed_param = float(data.get("zoom_speed", 0.0002)) # Even slower zoom
+        # Default max zoom to 1.2x, adjustable via 'max_zoom' in request body
+        max_zoom_param = float(data.get("max_zoom", 1.2)) # Set default max zoom to 1.2x
 
         if not image_url:
             raise HTTPException(status_code=400, detail="Missing image_url")
@@ -54,19 +60,28 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         output_video = f"{CLIP_DIR}/{timestamp}.mp4"
 
         # Download image
-        # Using subprocess.run for external commands like curl.
-        # check=True raises CalledProcessError if the command returns a non-zero exit code.
         subprocess.run(["curl", "-L", image_url, "-o", input_image], check=True)
 
         # Validate if the image was downloaded successfully
         if not os.path.exists(input_image) or os.path.getsize(input_image) < 1024:
             raise HTTPException(status_code=422, detail="Invalid image or download failed")
 
-        # FFmpeg filter complex for zoom, scaling, and padding.
-        # Using triple quotes for zoom_expr to allow single quotes within the string without escaping.
+        # FFmpeg filter complex for zoom, scaling, and padding for Reels format.
+        # - `scale=8000:-1`: Upscales the input image to 8000px width (maintaining aspect ratio)
+        #   for higher quality during the zoompan effect.
+        # - `zoompan`: Applies a smooth zoom effect.
+        #   - `z='min(zoom+{zoom_speed_param},{max_zoom_param})'`: Controls the zoom level,
+        #     increasing it by `zoom_speed_param` per frame up to `max_zoom_param`.
+        #   - `d={int(duration * frame_rate)}`: Sets the duration of the zoompan effect
+        #     to cover the entire video clip's frames. Omitting 'x' and 'y' means it zooms from the center.
+        # - `scale=720:1280:force_original_aspect_ratio=decrease`: Scales the result to fit
+        #   within 720x1280 pixels, maintaining the aspect ratio and ensuring the full content
+        #   is visible (not cropped).
+        # - `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black`: Adds black bars as padding to the scaled video
+        #   to precisely match the 720x1280 (9:16 vertical) resolution for Reels, if necessary.
         zoom_expr = (
             f"scale=8000:-1,"  # Upscale for clarity before zoompan
-            f"zoompan=z='min(zoom+{zoom_speed},1.5)':x='if(gte(zoom,1.5),x,x+1)':y='y':d={int(duration * frame_rate)},"  # Smooth zoom over clip duration
+            f"zoompan=z='min(zoom+{zoom_speed_param},{max_zoom_param})':d={int(duration * frame_rate)},"  # Smooth zoom from center, capped at max_zoom_param
             f"scale=720:1280:force_original_aspect_ratio=decrease,"  # Scale to fit 720x1280 without cropping
             f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"  # Pad to fill 720x1280 with black bars if aspect ratio doesn't match
         )
