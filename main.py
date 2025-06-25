@@ -55,6 +55,12 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         zoom_expr = (
     f"scale=8000:-1,"  # upscale for clarity
     f"zoompan=z='min(zoom+{zoom_speed},1.5)':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # smooth zoom
+    f"scale=720:1280:force_original_aspect_ratio=decrease,"  # scale to fit without cropping
+    f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"  # pad to vertical TikTok/Reels size
+)':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # smooth zoom
+    f"scale=720:1280:force_original_aspect_ratio=decrease,"  # scale to fit without cropping
+    f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"  # pad to vertical TikTok/reels size
+),x,x+1)':y='y':d=1,"  # smooth zoom
     f"scale=720:1280:force_original_aspect_ratio=decrease,"  # scale to fit vertical
     f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"  # pad to fill TikTok/Reels format
 )':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # zoom and pan
