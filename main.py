@@ -53,8 +53,11 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
 
         # Final zoom filter: upscale for clean zoom, then animate zoompan, then pad for TikTok/reels format
         zoom_expr = (
-    f"scale=8000:-1,"  # upscale first for zoom clarity
-    f"zoompan=z='min(zoom+{zoom_speed},1.5)':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # zoom and pan
+    f"scale=8000:-1,"  # upscale for clarity
+    f"zoompan=z='min(zoom+{zoom_speed},1.5)':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # smooth zoom
+    f"scale=720:1280:force_original_aspect_ratio=decrease,"  # scale to fit vertical
+    f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"  # pad to fill TikTok/Reels format
+)':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # zoom and pan
     f"scale=720:1280:force_original_aspect_ratio=decrease,"  # scale to fit without cropping
     f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"  # pad to vertical TikTok/reels size
 )':x='if(gte(zoom,1.5),x,x+1)':y='y':d=1,"  # zoom and pan
@@ -84,7 +87,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
 
         return {
             "clip_path": output_video,
-            "public_url": f"https://image-to-video-api-qkjd.onrender.com/static/clips/{os.path.basename(output_video)}"
+            "public_url": f"/static/clips/{os.path.basename(output_video)}"
         }
 
     except subprocess.CalledProcessError as err:
