@@ -56,14 +56,13 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         # fitted size within the 720x1280 frame, and grows to 1.0 (filling that fitted size).
         max_grow_factor = float(data.get("max_zoom", 1.25)) # Default grow factor to 1.25x
 
-        # Calculate the initial zoom level for the zoompan filter.
-        # Image will start at this scale (e.g., 0.8) and grow to 1.0.
+        # Calculate the initial zoom level. Image will start at this scale (e.g., 0.8).
         initial_zoom_level = 1.0 / max_grow_factor
         
-        # Calculate the speed at which the zoom (growth) happens per second.
-        # It goes from initial_zoom_level to 1.0 over the clip's duration.
-        zoom_speed_per_second = (1.0 - initial_zoom_level) / duration
+        # Define the end zoom level, which is 1.0 (image fills its designated space).
+        zoom_end_level = 1.0
         
+        # Calculate total frames for the zoompan duration parameter.
         total_frames = int(duration * frame_rate)
 
         if not image_url:
@@ -83,11 +82,12 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         # FFmpeg filter complex for a stable "grow" effect without cutting, outputting 720x1280.
         # The order of filters is crucial for preventing cutting:
         # 1. `scale=8000:-1`: Upscales the input image to 8000px width (maintaining aspect ratio)
-        #    for higher quality during the zoompan effect. This is similar to your reference command.
+        #    for higher quality during the zoompan effect.
         # 2. `zoompan`: This filter applies the actual dynamic scaling (the "grow" effect).
-        #    - `z='min({initial_zoom_level} + t*{zoom_speed_per_second}, 1.0)'`:
-        #      The zoom factor starts at `initial_zoom_level` (e.g., 0.8) and increases linearly with `t` (time in seconds)
-        #      up to a maximum of `1.0`. This creates the "grow" effect from a smaller size to its full fitted size.
+        #    - `z='({initial_zoom_level:.6f} + (({zoom_end_level:.6f} - {initial_zoom_level:.6f}) / {duration:.6f}) * t)'`:
+        #      This is the linear interpolation formula for zoom. It starts at `initial_zoom_level`
+        #      and smoothly progresses towards `zoom_end_level` (1.0) over the `duration` (in seconds).
+        #      Using `:.6f` ensures clean float formatting for FFmpeg.
         #    - `x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'`: These expressions keep the center of the image
         #      aligned with the center of the output frame as it grows.
         #    - `d={total_frames}`: The duration of the zoompan effect in frames.
@@ -98,7 +98,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
         #    the desired size and handles the aspect ratio fitting.
         zoom_expr = (
             f"scale=8000:-1,"  # Upscale for quality before zoompan
-            f"zoompan=z='min({initial_zoom_level} + t*{zoom_speed_per_second}, 1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={output_width}x{output_height}"
+            f"zoompan=z='({initial_zoom_level:.6f} + (({zoom_end_level:.6f} - {initial_zoom_level:.6f}) / {duration:.6f}) * t)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={output_width}x{output_height}"
         )
 
         # FFmpeg command to create the video clip
