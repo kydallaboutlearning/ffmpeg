@@ -1,54 +1,28 @@
 # render.yaml
-
-# This specifies the version of the Render Blueprint spec.
 version: 1
-
-# Define the services that make up your application.
 services:
-  # This defines a web service, which is accessible via HTTP.
   - type: web
-    name: tiktok-video-api # A unique name for your service on Render
-    env: python # The runtime environment for your service (Python)
-    region: oregon # Recommended region (often closest to US/Europe, or choose one near your users if different)
-    
-    # --- IMPORTANT: Using the 'free' plan as requested ---
-    # Be aware that the free tier has severe limitations for CPU-intensive tasks
-    # like FFmpeg video processing. Expect timeouts, slow responses, and potential
-    # service crashes due to limited CPU/RAM and service sleeping after inactivity.
-    plan: free 
+    name: tiktok-video-api
+    env: python
+    region: oregon
+    plan: free # As requested
 
-    branch: main # The Git branch that Render should deploy from (e.g., 'main' or 'master')
-
-    # The build command is executed when Render deploys your service.
-    # This is where we install system-level dependencies like FFmpeg
-    # and then your Python dependencies.
     buildCommand: |
       echo "--- Updating apt-get and installing FFmpeg ---"
-      # Update package lists to ensure we get the latest FFmpeg version
       apt-get update -y
-      # Install FFmpeg. The -y flag automatically answers yes to prompts.
       apt-get install -y ffmpeg
       echo "--- Installing Python dependencies ---"
-      # Install your Python packages from requirements.txt
       pip install -r requirements.txt
 
-    # The start command is executed after the build is complete, to run your application.
-    # Uvicorn is used to serve your FastAPI app.
-    # $PORT is an environment variable automatically provided by Render.
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
 
-    # A health check path. Render will periodically hit this endpoint
-    # to ensure your service is running. If it returns a non-200 status,
-    # Render might restart your service.
     healthCheckPath: /
 
-    # Environment variables for your service.
     envVars:
-      # Render provides the PORT environment variable; Uvicorn needs to use it.
       - key: PORT
-        value: 10000 # Example port, Render will set the actual external port
-
-      # Explicitly set Python version for consistency.
-      # Make sure this matches your local Python version or what's in requirements.txt.
+        value: 10000 
+      # --- IMPORTANT: CHANGE PYTHON VERSION HERE ---
       - key: PYTHON_VERSION
-        value: 3.10.12 # Adjust to your specific version if different (e.g., 3.9.18, 3.11.x)
+        value: 3.11.9 # Recommended: Change to 3.11.x (e.g., 3.11.9 or 3.11.8)
+        # OR
+        # value: 3.12.3 # If you prefer 3.12.x, but 3.11 is generally very stable
