@@ -51,7 +51,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
 
         # TikTok-style vertical formatting with animated zoom
         zoom_expr = (
-            f"zoompan=z='if(lte(zoom,1.0),1.2,zoom+{zoom_speed})':d=1:s={frame_count}:"
+            f"zoompan=z='if(lte(zoom,1.0),1.2,zoom+{zoom_speed})':d=1:n={frame_count}:"
             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',fps={frame_rate},"
             f"scale=w=720:h=-1,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"
         )
@@ -70,7 +70,7 @@ async def generate_clip(request: Request, background_tasks: BackgroundTasks):
 
         background_tasks.add_task(delete_files, [input_image, output_video], delay=3600)
 
-        return {"clip_path": output_video, "public_url": f"/static/clips/{os.path.basename(output_video)}"}
+        return {"clip_path": output_video, "public_url": f"https://image-to-video-api-qkjd.onrender.com/static/clips/{os.path.basename(output_video)}"}
 
     except HTTPException as http_err:
         raise http_err
