@@ -1,7 +1,34 @@
+# render.yaml
+# For more information on Render Blueprints: https://render.com/docs/blueprint
 services:
   - type: web
-    name: image-to-video-api
+    name: tiktok-video-api
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host=0.0.0.0 --port=10000
+    region: oregon # Choose a region closest to your users or other services (e.g., oregon, frankfurt, singapore)
+    plan: free # Or 'standard' for more resources. 'starter' might be sufficient for light usage.
+    branch: main # Or the branch you want to deploy from
+    buildCommand: |
+      # Install ffmpeg via apt-get (Render's underlying OS is Debian-based)
+      apt-get update -y
+      apt-get install -y ffmpeg
+      # Install Python dependencies
+      pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 10000 # Render automatically sets this, but it's good practice to define for uvicorn
+      - key: PYTHON_VERSION
+        value: 3.10.12 # Or your specific Python version from requirements.txt or local environment
+      # Add any other environment variables your app might need
+      # - key: MY_API_KEY
+      #   value: my_secret_key
+
+# Optional: If you want a persistent disk for generated videos (highly recommended for production)
+# You would then modify your FastAPI code to save files to this disk, e.g., /var/data/
+# And configure your cleanup to only remove from this disk, or use cloud storage like S3.
+# This setup requires a Starter+ plan.
+# disks:
+#   - name: video-storage
+#     mountPath: /var/data
+#     sizeGB: 10 # Adjust size as needed
